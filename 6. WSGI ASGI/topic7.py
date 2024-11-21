@@ -1,53 +1,81 @@
+import json
+from typing import Any
+
 import requests
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-
-app = FastAPI()
-
-BASE_URL = 'https://api.exchangerate-api.com/v4/latest'
 
 
-@app.get(
-    '/{currency}',
-    summary='Получить курс валют',
-    description='Возвращает курс указанной валюты к доллару США.',
-)
-async def get_exchange_rate(currency: str):
-    """Функция для получения курса валют к доллару."""
+def fetch_exchange_rate(currency: str):
+    """Получает курс валюты из API."""
 
-    if len(currency) != 3 or not currency.isalpha():
-        raise HTTPException(
-            status_code=400,
-            detail='Некорректный код валюты. Используйте 3 буквы, например USD',
-        )
-
-    url = f'{BASE_URL}/{currency.upper()}'
+    API_URL = f'https://api.exchangerate-api.com/v4/latest/{currency}'
 
     try:
-        response = requests.get(url)
+        response = requests.get(API_URL)
         response.raise_for_status()
 
         data = response.json()
 
-        return JSONResponse(content=data)
+        if 'rates' not in data:
+            raise ValueError('Неверный формат ответа от API')
 
-    except requests.exceptions.HTTPError as http_error:
-        if (
-            response.status_code == 404
-            or 'currency not found' in response.text.lower()
-        ):
-            raise HTTPException(
-                status_code=404,
-                detail=f'Валюта "{currency}" не найдена',
-            )
-        else:
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f'Ошибка от API: {response.text}',
-            )
+        return data
+
+    except requests.exceptions.HTTPError as err:
+        if err.response.status_code == 404:
+            raise ValueError(f'Валюта {currency} не поддерживается API')
+
+        raise ValueError(f'Ошибка запроса: {err}')
+
+    except requests.exceptions.RequestException as err:
+        raise ValueError(f'Ошибка запроса: {err}')
+
+    except json.JSONDecodeError:
+        raise ValueError('Неверный ответ от API')
 
 
-if __name__ == '__main__':
-    import uvicorn
+async def send_response(send: Any, status: int, content: dict):
+    """Унифицированный метод отправки ответа."""
 
-    uvicorn.run(app, host='127.0.0.1', port=8000)
+    await send(
+        {
+            'type': 'http.response.start',
+            'status': status,
+            'headers': [(b'content-type', b'application/json')],
+        }
+    )
+    await send(
+        {
+            'type': 'http.response.body',
+            'body': json.dumps(content, ensure_ascii=False).encode('utf-8'),
+        }
+    )
+
+
+async def app(scope: dict, receive: Any, send: Any):
+    """ASGI-приложение для проксирования курса валют."""
+
+    if scope['type'] != 'http':
+        await send_response(send, 500, {'error': 'Неверный тип запроса'})
+
+        return
+
+    path = scope.get('path', '/').lstrip('/')
+
+    if not path or len(path) != 3 or not path.isalpha():
+        await send_response(
+            send,
+            400,
+            {'error': 'Укажите валюту из 3 буквенных символов'},
+        )
+
+        return
+
+    currency = path.upper()
+
+    try:
+        data = fetch_exchange_rate(currency)
+
+        await send_response(send, 200, data)
+
+    except ValueError as err:
+        await send_response(send, 400, {'error': str(err)})
